@@ -83,6 +83,21 @@ architecture diagram that claims more than the system does. The concurrency
 story is told by the four Postgres features in §6.1 instead, each of which a
 judge can interrogate directly.
 
+### On the ledger: an addition, not a deviation (P19)
+
+NPCI's Drunix is not in the original spec and not in the production design. It
+was added after P18 for one job — making the policy log tamper-evident to a
+party that does not trust this database — and specified as §7.9 so the spec
+stays the authority on *what*. It replaces nothing: Postgres remains the
+source of truth (invariant 1), only Merkle roots leave it, and it is off by
+default exactly as the LLM is. The candidates it was **not** used for, and why:
+
+| Tempting use | Why not |
+|---|---|
+| Replace Postgres | The design rests on one-transaction event + outbox, `SKIP LOCKED`, partial unique indexes as business rules and `LISTEN/NOTIFY` inside the writing transaction. A ledger offers none of them, and endorse → order → commit is seconds, not milliseconds |
+| The payment rail | Drunix is ledger infrastructure for tokenisation and multi-party networks. It does not process card or UPI payments or emit gateway webhooks |
+| Idempotency | `UNIQUE` already gives at-most-once effect, synchronously, in the same transaction as the write |
+
 ---
 
 ## 0.2 Security and correctness audit (after P5)
@@ -1343,6 +1358,119 @@ incident rather than by waiting).
 
 ---
 
+## P19 — Tamper-evident policy log on NPCI Drunix (optional)
+
+**Status:** DONE — 13 unit, 16 integration, `bun run check` green. The Drunix
+round trip is **not** verified (no Drunix network in this environment; see
+*Watch for*).
+
+- `migrations/010_ledger_anchors.sql` — `ledger_anchors` (root, leaf count,
+  time range, `PENDING | ANCHORED | FAILED`, attempts, tx, block),
+  `ledger_anchor_items` (**decision PK**: batched at most once, by constraint;
+  **no FK** to `policy_decisions`, so a deleted decision surfaces as a missing
+  leaf instead of vanishing with its evidence), and `sim_ledger` (the
+  simulated ledger, `root` UNIQUE)
+- `domain/merkle.ts` — PURE. RFC 6962: `0x00`/`0x01` domain separation, odd
+  node promoted never duplicated, proofs of ⌈log₂ n⌉ steps. `decisionLeaf()`
+  commits to the canonical JSON of the **whole row**, not `input_hash` alone
+- `lib/ledger.ts` — the port (`anchor`, `getAnchor`, `close`), idempotent by
+  root; `LedgerConflictError` for "same root, different metadata", classified
+  by class; `ledgerStatus()` for `/ready`, with the reason when off
+- `lib/drunix.ts` — the stock `@hyperledger/fabric-gateway` client against a
+  Lite Peer, as Drunix's own `application-gateway-typescript` sample connects.
+  Reads first so a crash between commit and our UPDATE reconciles instead of
+  re-endorsing; a race answered by the contract with the original record
+  returns the original tx. Reads on the page path have a 3 s deadline.
+  Loaded with a dynamic `import()`, so gRPC is not in the process unless
+  `LEDGER_PROVIDER=drunix`
+- `sim/ledger.ts` — the same port over `sim_ledger`, `ON CONFLICT (root) DO
+  NOTHING` and read-back. Labelled `simulated` everywhere it shows
+- `app/anchor.ts` — **batch** (local, one transaction, advisory lock, ≤ 256
+  leaves × 8 roots a pass, insertion order) then **submit** (row lock held
+  across the call, least-tried first, first transient failure ends the pass,
+  8 attempts to `FAILED`, conflicts fail at once, loop backs off to 5 min).
+  **Verify** recomputes leaf → proof → root → ledger on request; `ok` is
+  `true`, `false`, or `null` with a reason, and `null` is never counted as
+  either. `verifyBatch()` is the check that catches deletions
+- `/audit` — every policy node carries its ledger check beside *reproduced*,
+  with the inclusion proof under a disclosure; an *anchored n/m* tile. Off and
+  never anchored → no check rather than a wall of "not anchored"
+- `/policy` — the tamper-evident log panel: anchored / awaiting / failed
+  decisions, last block and tx, the provider badge, the last ledger error
+- `ledger/chaincode` — `revenant-anchor` (TypeScript, `fabric-contract-api`
+  2.5): `Anchor(root, leafCount, firstDecidedAt, lastDecidedAt)`,
+  `GetAnchor(root)`. Deterministic (tx id, submitter MSP, tx timestamp — never
+  `Date.now()`), fixed key order, idempotent by root, emits `AnchorRecorded`.
+  Not a workspace: it runs in the peer's Node runtime, built by `deployCC`
+- `/api/v1/ledger` (+ `anchors`, `anchors/:id/verify`, `decisions/:id`,
+  `anchor`, `anchors/:id/retry`); `/ready` gains `checks.ledger` (never
+  gating); `sim/reset`, `bun seed`, `bun sim:clear` truncate the three tables
+
+**Gate:**
+
+Run on a fresh PostgreSQL 16.15 on `:5434` (Homebrew, not the Docker
+container — Docker was not available), migrations 001–010 applied from empty.
+
+```
+bun run check                 lint + typecheck (api, web) + 349 unit tests, green (336 → 349)
+bun run test:integration      115 tests: 113 pass · 1 skip · 1 fail
+  ledger suite                16 / 16 pass
+next build (apps/web)         every page compiles, /policy and /audit included
+ledger/chaincode              tsc --strict against fabric-contract-api / fabric-shim 2.5.8;
+                              Anchor + GetAnchor exercised against an in-memory stub —
+                              first write, idempotent repeat, conflicting repeat,
+                              invalid input, reads; metadata: Anchor SUBMIT, GetAnchor EVALUATE
+lib/drunix.ts under Bun       loads, reads cert/key from MSP directories, signs; against a
+                              closed port fails in ~40 ms with gRPC UNAVAILABLE, closes cleanly
+```
+
+The one failure is not P19's: P10's *"a second active model is refused by the
+constraint"* inserts an active model and expects the partial index to refuse
+it, which only happens when a model is **already** active. On an untrained
+database the insert succeeds, `err` stays `null`, and the assertion fails. It
+passes on a database that has run `bun train`; the test should create its own
+first active model rather than assume one.
+
+### Three things found while building it, all fixed
+
+1. **The batcher was global.** `batchUnanchored()` took every unbatched
+   decision in the database, so an integration test against a seeded
+   database would have anchored the seed's thousands of decisions as a side
+   effect. It now takes `onlyDecisions`, as the gate takes `onlyCases`, and
+   `submitPending()` takes `onlyAnchors`.
+2. **A test passed for the wrong reason.** The first domain-separation test
+   compared a node hash with a leaf hash of the same bytes *after a
+   latin1→utf8 round trip*, so it would have passed with the prefixes deleted.
+   It now pins `SHA-256(0x00 ‖ data)` byte for byte and hashes the raw 64
+   bytes as a leaf.
+3. **A lost race returned the wrong receipt.** When another writer anchors the
+   same root between our read and our submit, the contract answers with the
+   original record and our transaction writes nothing — but the adapter
+   reported *our* tx id and block. It now returns the original transaction.
+
+The outage behaviour was designed in rather than found: giving every batch an
+attempt each tick would spend all eight attempts of every batch in under a
+minute of Drunix downtime. So a transient failure ends the pass, the loop backs
+off exponentially, and the queue is least-tried first — one batch the ledger
+keeps refusing sinks behind fresh ones instead of blocking them.
+
+**Watch for:**
+- **The Drunix round trip is unproven here.** Drunix documents Fabric 2.5.x
+  compatibility and keeps the Gateway service (`internal/pkg/gateway`, with
+  CommitStatus forwarded to the Committing Peer), and everything up to the
+  gRPC call is exercised: the client loads and signs under Bun and fails in
+  ~40 ms with `UNAVAILABLE` against a closed port. `deployCC -ccl typescript`
+  on Drunix's peers, endorsement on a Lite Peer and commit status through the
+  Committing Peer have not been run. `ledger/README.md` is the procedure.
+- **The guarantee needs a second organisation.** On the two-org test network
+  one operator runs every peer, which proves no more than the database does.
+  Production means a channel where an acquirer or auditor endorses.
+- **Evidence trails decisions** by one interval plus ledger latency, and
+  indefinitely while the ledger is down. Decisions never wait for it — that
+  is the design — but a decision rewritten inside that window is undetectable.
+
+---
+
 ## Cut order if time runs out (§16)
 
 Cut from the top. Everything below the line still tells a complete story.
@@ -1382,6 +1510,13 @@ bun run check      # lint + typecheck + test
 
 bun db:reset       # drop the volume and re-migrate — scoped to minirevenant only
 bun db:psql        # psql into the container
+
+# P19 — optional ledger anchoring
+LEDGER_PROVIDER=simulated bun dev                 # anchor to sim_ledger, every check live
+curl -s localhost:8090/api/v1/ledger              # decisions by batch state, last anchor
+curl -sX POST localhost:8090/api/v1/ledger/anchor # one batch-and-submit pass now
+# Drunix: deploy ledger/chaincode on drunix-network/test-network, then
+# LEDGER_PROVIDER=drunix + DRUNIX_* — see ledger/README.md
 ```
 
 `bun dev` must not require `bun seed` to have run: an empty database renders an

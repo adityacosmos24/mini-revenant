@@ -114,6 +114,7 @@ concrete answer, and the answer must be visible in the UI.
 | Gateway | Razorpay Test Mode | **Simulated gateway** driven by ground-truth labels | Outcomes come from pre-decided counterfactuals, so recovery is measurable |
 | Time | Wall clock | **Simulated clock**, 1 real second = 30 simulated minutes | Lets a 7-day story play in 3 minutes |
 | LLM | Claude | Claude (`claude-sonnet-5`), optional, off by default | Deterministic fallback always present |
+| Tamper evidence | — | **Merkle roots of the policy log anchored on NPCI Drunix** (§7.9), optional, off by default | An addition, not a swap. Postgres stays the source of truth; only roots leave it |
 
 **Explicitly out of scope for the MVP:** auth (single hardcoded merchant switcher), multi-tenancy enforcement, Prometheus/Grafana, load testing, real webhooks over the internet.
 
@@ -176,7 +177,8 @@ revenant-mini/
 │  │  │  │  ├─ rca.ts              # excess-failure apportionment (§7.4)
 │  │  │  │  ├─ recovery-model.ts   # feature vector, logistic scoring, rule baseline (§7.5)
 │  │  │  │  ├─ strategy.ts         # expected-value engine (§7.6)
-│  │  │  │  └─ policy.ts           # policy engine + PolicyApprovedAction brand (§7.7)
+│  │  │  │  ├─ policy.ts           # policy engine + PolicyApprovedAction brand (§7.7)
+│  │  │  │  └─ merkle.ts           # RFC 6962 Merkle tree + decision leaf (§7.9)
 │  │  │  ├─ app/                   # use cases; orchestrates domain over ports
 │  │  │  │  ├─ ingest.ts           # event + outbox in ONE transaction
 │  │  │  │  ├─ relay.ts            # outbox → handlers, 200 ms tick
@@ -186,19 +188,24 @@ revenant-mini/
 │  │  │  │  ├─ recovery.ts         # opens cases, predicts, chooses strategy
 │  │  │  │  ├─ agent.ts            # LLM proposal + deterministic fallback
 │  │  │  │  ├─ executor.ts         # idempotent action execution
-│  │  │  │  └─ verify.ts           # attribution + prediction scoring
+│  │  │  │  ├─ verify.ts           # attribution + prediction scoring
+│  │  │  │  └─ anchor.ts           # batch → anchor → verify the policy log (§7.9, optional)
 │  │  │  ├─ sim/
 │  │  │  │  ├─ generator.ts        # deterministic dataset + ground truth (§8)
 │  │  │  │  ├─ clock.ts            # simulated clock, speed control
 │  │  │  │  ├─ gateway.ts          # simulated Razorpay
 │  │  │  │  ├─ runner.ts           # replays the dataset into the webhook path
+│  │  │  │  ├─ ledger.ts           # simulated ledger, a table here (§7.9)
 │  │  │  │  └─ whatif.ts           # BASELINE vs AGENT counterfactual replay (§8.7)
 │  │  │  ├─ ml/
 │  │  │  │  └─ train.ts            # logistic regression trainer + calibration + model card
 │  │  │  ├─ http/
 │  │  │  │  ├─ routes/*.ts         # one file per resource group (§10)
 │  │  │  │  └─ sse.ts              # event stream to the dashboard
-│  │  │  └─ lib/rng.ts             # seeded PRNG (mulberry32) — the whole demo is reproducible
+│  │  │  └─ lib/
+│  │  │     ├─ rng.ts              # seeded PRNG (mulberry32) — the whole demo is reproducible
+│  │  │     ├─ ledger.ts           # the ledger port + status (§7.9)
+│  │  │     └─ drunix.ts           # Drunix adapter over the Fabric Gateway client (§7.9)
 │  │  └─ package.json
 │  └─ web/
 │     ├─ app/
@@ -216,6 +223,7 @@ revenant-mini/
 │     ├─ lib/api.ts                # typed fetch client
 │     ├─ lib/stream.ts             # EventSource hook
 │     └─ package.json
+├─ ledger/chaincode/               # `revenant-anchor` contract for Drunix (§7.9), not a workspace
 └─ revenant-mini.md                # this file
 ```
 
@@ -896,6 +904,72 @@ Guarantees:
 - If the LLM picks an option whose EV ≤ 0 → override to the deterministic choice and record `rejected_reason`.
 - Every call is written to `agent_decisions` with a prompt hash. **The pipeline is correct with the LLM switched off; the demo must prove it by toggling it live.**
 
+### 7.9 Ledger anchoring — `domain/merkle.ts` + `app/anchor.ts` (optional, NPCI Drunix)
+
+```
+policy_decisions ──► batch (≤256 leaves) ──► Merkle root ──► Drunix ──► verify on /audit
+   (append-only)       (local, one txn)       (only this      (Fabric      (leaf · proof ·
+                                               leaves)        2.5 fork)     root on ledger)
+```
+
+`policy_decisions` is append-only by convention — nothing updates it — but
+anyone with database access could. This makes a rewrite **detectable by someone
+who does not trust this database**, without putting a single decision on a
+shared ledger. Off by default (`LEDGER_PROVIDER=none`); every other stage is
+identical with it off. It is an addition beyond the production design, not a
+swap.
+
+**The tree** (`domain/merkle.ts`, PURE). RFC 6962 construction: leaf =
+`SHA-256(0x00 ‖ data)`, node = `SHA-256(0x01 ‖ left ‖ right)`, an odd node is
+promoted, never duplicated. A leaf commits to the canonical JSON (keys sorted
+at every depth) of the **whole row** — `id, case_id, proposed_action, verdict,
+reasons, policy_version, input_hash, decided_at` — not just `input_hash`, so an
+edited verdict breaks the leaf even if the hash column is left alone.
+
+**Batch** — local, never waits on the ledger. Every 5 s, decisions in no batch
+are taken in insertion order (`ORDER BY id`), up to 256 per root and 8 roots per
+pass, and committed as one `ledger_anchors` row plus one `ledger_anchor_items`
+row per decision in one transaction, under `pg_try_advisory_xact_lock`.
+`ledger_anchor_items.decision_id` is the primary key: anchored at most once, by
+constraint. No foreign key to `policy_decisions`, on purpose — a decision
+deleted after anchoring must surface as a missing leaf, not vanish with its
+evidence.
+
+**Submit.** Each `PENDING` root goes to the ledger with its leaf count and
+simulated time range — nothing else. The row lock is held across the call
+(`FOR UPDATE SKIP LOCKED`). Both ledgers are idempotent by root: the same root
+with the same metadata returns the original transaction; with different
+metadata it is a `LedgerConflictError`, which fails the batch at once.
+Transient errors keep it `PENDING`, least-tried first, and end the pass; after
+**8** it is `FAILED` and re-queueable. The loop backs off exponentially to 5
+minutes while the ledger fails. A ledger that is down delays the *evidence*,
+never a decision or an action.
+
+**Verify** — recomputed on request, never cached:
+
+| Status | Meaning | `ok` |
+|---|---|---|
+| `verified` | leaf matches the row as it is now, proof folds to the root, root is on the ledger | `true` |
+| `mismatch` | row changed · stored leaves no longer give the root · root not on the ledger · leaf count differs | `false` |
+| `pending` / `failed` | batched; the ledger has not confirmed / refused | `null` |
+| `unanchored` | in no batch yet | `null` |
+| `unavailable` | the ledger could not be asked within 3 s | `null` |
+
+`null` is never counted as either verified or tampered (invariant 6). Only the
+ledger copy of a root is trusted. `GET /ledger/anchors/:id/verify` checks a
+whole batch and is the check that catches a **deleted** decision.
+
+**Two ledgers behind one port** (`lib/ledger.ts`):
+
+- `simulated` — `sim_ledger`, a table in this database. Exercises every path
+  and check; proves nothing to a third party, and is labelled so wherever it
+  shows.
+- `drunix` — NPCI's Drunix, a Hyperledger Fabric 2.5 fork that splits the peer
+  into a Lite Peer (endorses, keeps the Fabric Gateway service) and a
+  Committing Peer. The client is the stock `@hyperledger/fabric-gateway` SDK
+  against a Lite Peer; the contract is `ledger/chaincode` (`revenant-anchor`:
+  `Anchor`, `GetAnchor`), deterministic and idempotent by root.
+
 ---
 
 ## 8. The simulator
@@ -1117,6 +1191,14 @@ GET  /api/v1/calibration/live                 predicted vs actual on VERIFIED ou
 
 GET  /api/v1/audit/:paymentId                 the full chain: event → detection → diagnosis → decision
                                               → policy → action → outcome, in order, with timestamps
+                                              (policy nodes carry their ledger check, §7.9)
+
+GET  /api/v1/ledger                           provider, decisions by batch state, last anchor (§7.9)
+GET  /api/v1/ledger/anchors?limit             recent batches: root, leaf count, status, tx, block
+GET  /api/v1/ledger/anchors/:id/verify        whole batch: present, missing, changed, root on ledger
+GET  /api/v1/ledger/decisions/:id             one decision: leaf, inclusion proof, ledger check
+POST /api/v1/ledger/anchor                    run one batch-and-submit pass now
+POST /api/v1/ledger/anchors/:id/retry         re-queue a FAILED batch
 
 POST /api/v1/simulation/whatif                run BASELINE vs AGENT on the held-out split (§8.7)
 GET  /api/v1/simulation/whatif                the last stored comparison
@@ -1378,6 +1460,13 @@ Measured, not asserted
 - [ ] The what-if comparison runs on the **held-out split only** and says so on the page.
 - [ ] Both what-if arms operate on an identical set of failed payments — assert the counts match.
 
+Tamper evidence (when `LEDGER_PROVIDER` is set, §7.9)
+- [ ] A decision is batched at most once — a second item is rejected by the primary key, not by an `if`.
+- [ ] An anchored decision verifies on `/audit`; edit its row and it reads `mismatch`, while its neighbours still verify.
+- [ ] Delete an anchored decision and its batch's verification names it as missing.
+- [ ] A root absent from the ledger is a `mismatch`, never `verified`.
+- [ ] With the ledger unreachable, decisions and actions proceed and the check reads `unavailable` — `null`, not `false`.
+
 Resilience (each demonstrable live)
 - [ ] Unset `ANTHROPIC_API_KEY` → everything still works, badges flip to `template`.
 - [ ] Delete the trained model row → predictions fall back to the baseline, flagged.
@@ -1449,6 +1538,19 @@ WEBHOOK_SECRET=revenant_mini_dev_secret
 ANTHROPIC_API_KEY=           # optional — leave empty to prove the deterministic path
 ANTHROPIC_MODEL=claude-sonnet-5
 NEXT_PUBLIC_API_URL=http://localhost:8090
+
+LEDGER_PROVIDER=none         # optional (§7.9): none | simulated | drunix
+LEDGER_BATCH_SIZE=256
+LEDGER_INTERVAL_MS=5000
+LEDGER_TIMEOUT_MS=15000
+DRUNIX_PEER_ENDPOINT=localhost:7051          # a Lite Peer — it runs the Fabric Gateway
+DRUNIX_PEER_HOST_ALIAS=peer0.org1.example.com
+DRUNIX_TLS_CERT_PATH=                        # absolute; see ledger/README.md
+DRUNIX_MSP_ID=Org1MSP
+DRUNIX_CERT_PATH=                            # file or msp/signcerts directory
+DRUNIX_KEY_PATH=                             # file or msp/keystore directory
+DRUNIX_CHANNEL=mychannel
+DRUNIX_CHAINCODE=revenant-anchor
 ```
 
 Secrets come only from the environment, `.env` is gitignored, and configuration
