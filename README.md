@@ -18,9 +18,38 @@ DETECT → DIAGNOSE → QUANTIFY → DECIDE → GATE → ACT → VERIFY → LEAR
 
 ---
 
+## DRUNIX Hackathon 2026 (NPCI × Citi) — at a glance
+
+| | |
+|---|---|
+| **Track** | Real-Time Payments |
+| **Problem** | Payment failures are visible only as one blended rate. Merchants either retry everything blindly or switch processors on a hunch, and as recovery is automated nobody can later prove an automated money action followed the rules. |
+| **What Revenant does** | Detects which slice is failing, diagnoses why, prices every failed payment, picks the cheapest intervention that pays (or does nothing), gates it through twelve policy rules, executes it without double-charging, and verifies the outcome. |
+| **What DRUNIX does** | Holds the tamper-evident record of every automated money decision. The policy log is batched into Merkle roots, and only the roots are anchored through the `revenant-anchor` chaincode via the Fabric Gateway on a DRUNIX Lite Peer. Any decision is provable with at most eight hashes, and no payment or customer data goes on the ledger. |
+| **DRUNIX elements** | Chaincode (built) · Fabric Gateway SDK against a Lite Peer (built) · multi-org endorsement design (designed) · private data collections and YugabyteDB (planned). Details: [`ledger/README.md`](ledger/README.md#multi-organisation-network-design) |
+| **Status** | Working end to end on a deterministic simulator, with ledger anchoring running live against the simulated ledger. A round trip on a DRUNIX test network is the next milestone. |
+| **Evidence** | Two full replays (seed 42, 75,000 payments): **+₹8.0–8.2 lakh** recovered over blind retries on the same 1,025 held-out failures (2.1×), with 6% fewer interventions. All 6 injected incidents detected, both noise windows clean. All **6,642** policy decisions anchored in 98 Merkle roots, none failed. |
+| **Team** | qbit · pitch deck: [`docs/pitch/`](docs/pitch/Revenant-qbit-DRUNIX-Hackathon-2026.pdf) |
+
+**Evaluate it in five minutes** (Bun 1.2+ and Docker):
+
+```bash
+bun install && cp .env.example .env
+bun db:up
+LEDGER_PROVIDER=simulated bun dev     # api :8090, web :3000
+```
+
+Open http://localhost:3000 and press **▶ Play**. As the replay runs, `/policy`
+shows decisions being anchored. Open any payment's audit page from the
+decision log: each policy decision shows its ledger check and Merkle proof.
+`bun test` runs the 349 unit tests. The demo video below covers P0–P18 and
+predates the DRUNIX work (P19).
+
+---
+
 ## Contents
 
-[The problem](#the-problem) · [What it actually does](#what-it-actually-does) · [Why "Revenant"](#why-revenant) · [The product, page by page](#the-product-page-by-page) · [Quick start](#quick-start) · [Architecture](#architecture) · [The stack, and why](#the-stack-and-why) · [Domain logic](#domain-logic-module-by-module) · [Hard invariants](#hard-invariants) · [How it is tested](#how-it-is-tested) · [How it would behave in production](#how-it-would-behave-in-production) · [Using it](#using-it) · [The policy log on NPCI Drunix](#the-policy-log-on-npci-drunix-optional) · [Configuration](#configuration) · [Known limitations](#known-limitations) · [Troubleshooting](#troubleshooting)
+[DRUNIX Hackathon at a glance](#drunix-hackathon-2026-npci--citi--at-a-glance) · [The problem](#the-problem) · [What it actually does](#what-it-actually-does) · [Why "Revenant"](#why-revenant) · [The product, page by page](#the-product-page-by-page) · [Quick start](#quick-start) · [Architecture](#architecture) · [The stack, and why](#the-stack-and-why) · [Domain logic](#domain-logic-module-by-module) · [Hard invariants](#hard-invariants) · [How it is tested](#how-it-is-tested) · [How it would behave in production](#how-it-would-behave-in-production) · [Using it](#using-it) · [The policy log on NPCI Drunix](#the-policy-log-on-npci-drunix-optional) · [Configuration](#configuration) · [Known limitations](#known-limitations) · [Troubleshooting](#troubleshooting)
 
 ---
 
@@ -73,10 +102,16 @@ can honestly take credit.
 | **VERIFY** | Outcomes attributed `direct`, `assisted` or `organic` — organic credits **zero**. Each prediction is stored beside what actually happened. |
 | **LEARN** | A live calibration curve — what the model promised at training time next to what it has delivered since — is published on the model page. |
 
-The result, on data neither arm was tuned against:
+The result, on data neither arm was tuned against: both arms face the same
+1,025 held-out failed payments.
 
-> **₹17.2L incremental revenue** over blind retries, while attempting *fewer* interventions —
-> and international acceptance **67.9% → 84.8%** with no processor migration.
+> **₹8.0–8.2L more recovered than blind retries (2.1×)**, while attempting
+> *fewer* interventions. This was reproduced in two full replays on
+> 2026-10-25, one of the original code and one of the DRUNIX build.
+
+The run recorded for the screenshots measured ₹17.2L and international
+acceptance 67.9% → 84.8%. Detection, and so the trained model, depend on replay
+timing, so results move between runs. See [Reproducibility](#reproducibility).
 
 ## Why "Revenant"
 
@@ -180,7 +215,10 @@ tuned away.
 The same 1,025 held-out failed payments under two policies. Blind retries:
 1,025 interventions, 273 recovered, ₹7.2L. Revenant: **960 interventions** —
 fewer — **592 recovered, ₹24.4L**. Incremental **₹17.2L**. The founder's row:
-international acceptance 67.9% → 84.8%.
+international acceptance 67.9% → 84.8%. That is the run in the screenshot. The
+2026-10-25 re-runs recovered 328 and 336 payments: +₹8.02L and +₹8.18L, still
+2.1× blind retries with the same 960 interventions. See
+[Reproducibility](#reproducibility).
 
 The honesty banner is the first thing on the page: simulation over recorded
 counterfactuals, both arms see the same rows, labels were decided before either
@@ -452,15 +490,34 @@ received — caught and named.
 The generator injects five incidents and **two unlabelled noise windows**, and
 pre-decides every recovery counterfactual. That gives:
 
-| Measurement | This run |
-|---|---|
-| Detection precision | 75.8% (25 of 33 alerts inside a real window) |
-| Detection recall | 50% (3 of 6), each miss explained by the gate that refused it |
-| False positives | 8 |
-| Noise windows | **clean** — a detector that fires here is wrong |
-| RCA top-1 accuracy | 100% (3 of 3 diagnosed named the labelled tuple) |
-| Model | AUC 0.702 (baseline 0.708) · Brier 0.115 (baseline 0.174) |
-| Live calibration | 3,741 verified outcomes · predicted 80.1% vs observed 52.5% |
+| Measurement | Recorded run (screenshots) | Re-runs, 2026-10-25 (original code · DRUNIX build) |
+|---|---|---|
+| Detection precision | 75.8% (25 of 33 alerts inside a real window) | 75.0% of 80 alerts · 80.4% of 107 |
+| Detection recall | 50% (3 of 6), each miss explained by the gate that refused it | 100% (6 of 6) in both |
+| False positives | 8 | 20 · 21 |
+| Noise windows | **clean**: a detector that fires here is wrong | clean in both |
+| RCA accuracy | top-1 100% (3 of 3 diagnosed) | top-1 2 of 6 · 1 of 6; top-3 5 of 6 · 3 of 6 |
+| Model | AUC 0.702 (baseline 0.708) · Brier 0.115 (baseline 0.174) | AUC 0.850 · 0.839 · Brier 0.095 · 0.093 |
+| What-if, incremental over blind retry | ₹17.2L | ₹8.02L · ₹8.18L (2.1× in both) |
+| Live calibration | 3,741 verified outcomes · predicted 80.1% vs observed 52.5% | not re-measured |
+
+#### Reproducibility
+
+The dataset is byte-identical on every run: seed 42, checksum `01de6b16…`, and
+the blind-retry arm recovers the same 273 payments for ₹7,17,123 every time.
+What moves is everything downstream of **replay timing**:
+
+1. At 60× the emitter outruns the relay. How far behind the projection is when
+   each detection sweep runs depends on the machine.
+2. That changes which alerts open: 33, 80 and 107 alerts across three runs.
+3. The model's "inside an open incident" feature reads those alerts, so the
+   trained model differs.
+4. The model drives the strategy each case gets, and so the ₹ figure.
+
+The two 2026-10-25 re-runs, of the original code and of the DRUNIX build, agree
+with each other within 2% on the what-if and differ from the recorded run. So
+the variation is in the replay, not in the ledger work. To compare like with
+like, compare arms from the same replay, which is what the what-if does.
 
 Two of those numbers are unflattering and both are on the product's own pages.
 That is the point: a system that only reports the metric that makes it look good
@@ -525,8 +582,9 @@ HMAC-SHA256 over the raw body with a constant-time compare and caps the body at
 ### What the honest expected value looks like
 
 On the held-out split, the agent recovered **₹24.4L against blind retries'
-₹7.2L on identical failures**, using *fewer* interventions (960 vs 1,025) and
-₹6k of intervention cost. Those are real arithmetic over synthetic data. A real
+₹7.2L on identical failures** in the recorded run, and ₹15.2–15.4L in the
+2026-10-25 re-runs, using *fewer* interventions (960 vs 1,025) and ₹4–6k of
+intervention cost. Those are real arithmetic over synthetic data. A real
 deployment's number would differ — but the *method* of computing it, and the
 honesty banner that qualifies it, would not.
 

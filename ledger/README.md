@@ -44,6 +44,58 @@ root with different metadata is refused. The contract is also deterministic:
 it uses only its arguments, the transaction id, the submitter's MSP and the
 transaction timestamp, so every endorsing peer computes the same write set.
 
+## Multi-organisation network design
+
+The guarantee holds only if the operator can't write to the ledger alone. A
+ledger where every peer is run by the same party proves no more than the
+database does. The network is designed around that.
+
+| Organisation | Role | Runs |
+|---|---|---|
+| **PSP** (operates Revenant) | Submits anchors | Lite Peers (endorse, run the Fabric Gateway the anchorer connects to), a Committing Peer |
+| **Acquiring bank** | Co-endorses; verifies decisions on its merchants' payments | Lite Peer, Committing Peer |
+| **Independent auditor** | Co-endorses; verifies any decision on request | Lite Peer, Committing Peer |
+| **Merchant / aggregator** *(optional)* | Verifies its own decisions | Lite Peer, or read-only through another org |
+
+**Endorsement policy.** Every anchor needs the PSP plus at least one other
+organisation:
+
+```
+AND('PSPMSP.peer', OR('AcquirerMSP.peer', 'AuditorMSP.peer', 'MerchantMSP.peer'))
+```
+
+A root therefore can't appear on the ledger, or be replaced, without a second
+organisation's peer executing the contract and signing the result. The Fabric
+Gateway client builds the endorsement plan from service discovery, so the
+anchorer's code doesn't change as organisations join.
+
+**On the two-org test network,** you don't need an explicit policy to show
+this. In Fabric 2.5's sample channel configuration, the default chaincode
+endorsement policy is `MAJORITY Endorsement`, which with two organisations
+means both must endorse every anchor. To set the policy explicitly, Fabric's
+`network.sh deployCC` accepts `-ccep "AND('Org1MSP.peer','Org2MSP.peer')"`.
+Check `./network.sh -h` on Drunix's copy.
+
+**Why Drunix's architecture fits:**
+
+- **Lite Peer / Committing Peer separation.** Endorsement doesn't need local
+  ledger storage. Each organisation can run light endorsers close to its own
+  services, and keep committing peers, which hold the ledger, separate.
+- **Stateless validation service.** Validation scales horizontally as more
+  organisations, and more PSPs anchoring their own logs, join one channel.
+- **Ledger size.** Anchoring is one transaction per batch of up to 256
+  decisions, so the load stays small even at national scale.
+
+**Planned, not built:**
+
+- **Private data collections (KeyDB transient store).** Share each decision's
+  leaf hash only with the acquirer or auditor of that merchant, so they can
+  verify their own decisions from the ledger without asking the operator and
+  without seeing anyone else's.
+- **YugabyteDB state database.** A SQL-capable state store would let auditors
+  query anchors by organisation and time range directly. Today the contract
+  only needs key lookups by root, which LevelDB serves.
+
 ## Try it without a network
 
 ```bash

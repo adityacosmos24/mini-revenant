@@ -970,6 +970,17 @@ whole batch and is the check that catches a **deleted** decision.
   against a Lite Peer; the contract is `ledger/chaincode` (`revenant-anchor`:
   `Anchor`, `GetAnchor`), deterministic and idempotent by root.
 
+**Network design.** The guarantee needs a second organisation: a ledger whose
+every peer the operator runs proves no more than the database. Channel members
+are the PSP operating Revenant, the acquiring bank, an independent auditor and,
+optionally, the merchant. The endorsement policy is
+`AND('PSPMSP.peer', OR('AcquirerMSP.peer', 'AuditorMSP.peer', 'MerchantMSP.peer'))`,
+so no root lands or changes without another organisation signing. On the
+two-org test network, Fabric 2.5's default `MAJORITY Endorsement` already
+requires both. Private data collections, which would share leaf hashes with
+each merchant's auditor only, and a YugabyteDB state store, for auditor range
+queries, are planned, not built. Full design: `ledger/README.md`.
+
 ---
 
 ## 8. The simulator

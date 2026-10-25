@@ -538,7 +538,7 @@ names the fix (`bun sim:clear`).
 
 ## P7 — Detection
 
-**Status:** DONE — 185 unit + 51 integration; precision 1.000, noise windows clean
+**Status:** DONE — 185 unit + 51 integration; precision 1.000, noise windows clean (at this gate. Later full replays measured 75–80% with all 6 detected: detection depends on replay timing. See the README's *Reproducibility*.)
 
 - `domain/detector.ts` — EWMA + z-score behind the **five gates** of §7.3, every
   gate evaluated (none short-circuits) and each carrying the number it was
@@ -1413,8 +1413,11 @@ container — Docker was not available), migrations 001–010 applied from empty
 
 ```
 bun run check                 lint + typecheck (api, web) + 349 unit tests, green (336 → 349)
-bun run test:integration      115 tests: 113 pass · 1 skip · 1 fail
+bun run test:integration      115 tests: 114 pass · 1 skip · 0 fail (after the two test fixes below)
   ledger suite                16 / 16 pass
+full replay, ledger on        6,642 policy decisions anchored in 98 Merkle roots · 0 pending ·
+                              0 failed · a batch re-verified 8 of 8 against the ledger ·
+                              /policy and /audit render the checks
 next build (apps/web)         every page compiles, /policy and /audit included
 ledger/chaincode              tsc --strict against fabric-contract-api / fabric-shim 2.5.8;
                               Anchor + GetAnchor exercised against an in-memory stub —
@@ -1424,12 +1427,23 @@ lib/drunix.ts under Bun       loads, reads cert/key from MSP directories, signs;
                               closed port fails in ~40 ms with gRPC UNAVAILABLE, closes cleanly
 ```
 
-The one failure is not P19's: P10's *"a second active model is refused by the
-constraint"* inserts an active model and expects the partial index to refuse
-it, which only happens when a model is **already** active. On an untrained
-database the insert succeeds, `err` stays `null`, and the assertion fails. It
-passes on a database that has run `bun train`; the test should create its own
-first active model rather than assume one.
+Two tests failed along the way. Neither was P19's, and both are fixed:
+
+- **P10's *"a second active model is refused by the constraint"*** inserted an
+  active model and expected the partial index to refuse it. That only happens
+  when a model is **already** active, so on an untrained database the insert
+  succeeded and the assertion failed. The test now brings its own first active
+  model and removes both in a `finally`.
+- **P17's what-if test** scores every held-out row through the model, strategy
+  and policy engines twice. On a full replay that takes well past Bun's
+  five-second default, so it now has 120 s, like the other heavy suites.
+
+**A reproducibility finding, not a P19 bug.** Two full replays on this
+machine, one of the original code (with no ledger) and one of the DRUNIX build,
+agree with each other: what-if incremental ₹8.02L vs ₹8.18L, 6 of 6 incidents
+detected. Both differ from the README's recorded run (₹17.2L, 3 of 6), because
+detection depends on replay timing and the model reads detection's output. The
+README now reports both, with the chain written out under *Reproducibility*.
 
 ### Three things found while building it, all fixed
 
