@@ -107,18 +107,23 @@ describe('§14 — deleting the model falls back to the baseline, flagged', () =
   }, 120_000);
 
   test('a second active model is refused by the constraint, not by an if', async () => {
-    let err: unknown = null;
-    try {
+    // The constraint only bites with a model already active. An untrained
+    // database has none, so the test brings its own first one — otherwise the
+    // "duplicate" is simply the first active model and nothing is refused.
+    const brought = (await activeModelVersion()) === null;
+    if (brought) {
       await sql`
         INSERT INTO model_versions (id, kind, coefficients, calibration, metrics, is_active)
-        VALUES ('model_dup_test', 'logistic', '{}', '{}', '{}', TRUE)`;
-    } catch (e) {
-      err = e;
+        VALUES ('model_dup_first', 'logistic', '{}', '{}', '{}', TRUE)`;
     }
-    if (await activeModelVersion()) {
-      expect(String(err)).toContain('model_one_active');
-    } else {
-      await sql`DELETE FROM model_versions WHERE id = 'model_dup_test'`;
+    try {
+      await expect(sql`
+        INSERT INTO model_versions (id, kind, coefficients, calibration, metrics, is_active)
+        VALUES ('model_dup_test', 'logistic', '{}', '{}', '{}', TRUE)`).rejects.toThrow(/model_one_active/);
+    } finally {
+      // Removed here, not in afterAll: a placeholder left active would be
+      // loaded as the serving model by any suite that runs after this one.
+      await sql`DELETE FROM model_versions WHERE id IN ('model_dup_first', 'model_dup_test')`;
     }
   });
 });

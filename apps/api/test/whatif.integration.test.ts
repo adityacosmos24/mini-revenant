@@ -33,7 +33,10 @@ describe('the what-if comparison', () => {
     expect(back?.comparison.incrementalRevenuePaise).toBe(c.incrementalRevenuePaise);
 
     await sql`DELETE FROM simulations WHERE params->>'run_id' = ${run.run_id}`;
-  });
+    // Scores every held-out row through the model, the strategy engine and
+    // the policy engine twice over: well past Bun's five-second default on a
+    // full replay.
+  }, 120_000);
 
   test.skipIf(n > 0)('with no held-out rows the run refuses rather than printing zeros', async () => {
     await expect(runWhatIf()).rejects.toThrow(/no held-out rows/);
