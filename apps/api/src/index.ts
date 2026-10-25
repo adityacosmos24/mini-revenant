@@ -2,6 +2,7 @@ import { config, redacted } from './config.ts';
 import { closeDb } from './db/client.ts';
 import { migrate } from './db/migrate.ts';
 import { startRelay, stopRelay } from './app/relay.ts';
+import { startAnchorer, stopAnchorer } from './app/anchor.ts';
 import { startListener, stopListener } from './db/notify.ts';
 import { runner } from './sim/runner.ts';
 import { createApp } from './http/app.ts';
@@ -37,6 +38,13 @@ onShutdown('simulator', () => runner.shutdown());
 onShutdown('listener', stopListener);
 onShutdown('relay', stopRelay);
 startRelay();
+
+// Optional (LEDGER_PROVIDER): batches the policy log into Merkle roots and
+// anchors them. A no-op with a log line when off. Registered after the
+// database, so it stops — and lets an in-flight anchor finish — before the
+// pool closes.
+onShutdown('anchorer', stopAnchorer);
+startAnchorer();
 
 // One dedicated connection listens for `revenant_events` and fans out to SSE.
 await startListener();

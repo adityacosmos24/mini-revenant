@@ -2,6 +2,7 @@ import { Hono } from 'hono';
 import { ping } from '../../db/client.ts';
 import { schemaState, datasetState } from '../../db/queries.ts';
 import { describeError } from '../../lib/errors.ts';
+import { ledgerStatus } from '../../lib/ledger.ts';
 import { llmStatus } from '../../lib/llm.ts';
 import { log } from '../../lib/logger.ts';
 
@@ -25,6 +26,9 @@ health.get('/health', (c) =>
  *    and says why.
  *  - An unseeded database is **not** a reason to fail readiness either. It
  *    renders an empty dashboard, never a crash and never a fake number.
+ *  - Nor is the ledger. Anchoring is evidence produced after the fact; with it
+ *    off, unreachable or misconfigured, every decision is still made and
+ *    persisted. `ledger` reports the state and, when there is one, the error.
  * Only the database and its migrations gate readiness.
  */
 health.get('/ready', async (c) => {
@@ -70,6 +74,7 @@ health.get('/ready', async (c) => {
             }
           : null,
         llm: llmStatus(),
+        ledger: ledgerStatus(),
       },
       ...(error ? { error } : {}),
     },

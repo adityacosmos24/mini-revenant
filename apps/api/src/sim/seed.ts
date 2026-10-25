@@ -77,6 +77,7 @@ export async function seed(): Promise<Dataset> {
  */
 async function wipe(): Promise<void> {
   await sql`TRUNCATE
+    ledger_anchor_items, ledger_anchors, sim_ledger,
     outcome_verifications, recovery_actions, policy_decisions, agent_decisions,
     recovery_cases, incidents, ground_truth_labels, ground_truth_incidents,
     metrics_rollup, payment_state_transitions, payment_events, processed_events,

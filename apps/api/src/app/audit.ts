@@ -14,6 +14,8 @@ import { evaluatePolicy, type PolicyInput, type RuleResult } from '../domain/pol
 import type { Hypothesis } from '../domain/rca.ts';
 import type { StrategyOption } from '../domain/strategy.ts';
 import { NotFoundError } from '../lib/errors.ts';
+import { ledgerStatus } from '../lib/ledger.ts';
+import { ledgerChecks, type LedgerCheck } from './anchor.ts';
 
 /**
  * The chain of custody for one payment (§10 `GET /audit/:paymentId`, §11.2):
@@ -26,6 +28,10 @@ import { NotFoundError } from '../lib/errors.ts';
  * (policy decisions store the full `PolicyInput`; strategy options store the
  * arithmetic), the stage is **recomputed here** and the result compared,
  * rather than asserted.
+ *
+ * With a ledger configured, each policy decision also carries its ledger
+ * check: the leaf recomputed from the row as it is now, the inclusion proof to
+ * its batch's root, and that root looked up on the ledger itself.
  */
 
 export type Stage = 'event' | 'transition' | 'detection' | 'diagnosis' | 'case' | 'agent' | 'policy' | 'action' | 'outcome';
@@ -44,6 +50,8 @@ export interface AuditNode {
   reproduced?: { ok: boolean; detail: string } | undefined;
   /** Links for the page. */
   href?: string | undefined;
+  /** Policy nodes only: the decision checked against its anchored Merkle root. */
+  ledger?: LedgerCheck | undefined;
 }
 
 export interface AuditTrail {
@@ -52,6 +60,12 @@ export interface AuditTrail {
   counts: Partial<Record<Stage, number>>;
   /** Stages that stored their inputs and were recomputed on this request. */
   reproduced: { checked: number; ok: number };
+  /**
+   * Policy decisions checked against the ledger on this request. `unmeasured`
+   * covers not-yet-anchored and ledger-unreachable — never counted as either
+   * verified or tampered.
+   */
+  anchored: { decisions: number; verified: number; tampered: number; unmeasured: number };
 }
 
 /** TIMESTAMPTZ arrives as a Date from the driver; the trail speaks ISO strings. */
@@ -81,6 +95,13 @@ export async function auditTrail(paymentId: string): Promise<AuditTrail> {
 
   const nodes: AuditNode[] = [];
   const reproduced = { checked: 0, ok: 0 };
+
+  // With the ledger off and nothing ever anchored there is nothing to say per
+  // decision, so the check is left off rather than printed as a wall of
+  // "not anchored". Anything that *was* anchored is always checked.
+  const ledgerOn = ledgerStatus().enabled;
+  const checks = await ledgerChecks(policies);
+  const anchored = { decisions: 0, verified: 0, tampered: 0, unmeasured: 0 };
 
   for (const e of events) {
     const t = transitions.find((x) => x.event_id === e.event_id);
@@ -183,6 +204,14 @@ export async function auditTrail(paymentId: string): Promise<AuditTrail> {
       check = { ok, detail: ok ? `re-evaluated from the stored input: hash ${again.inputHash.slice(0, 8)}… matches, verdict ${again.verdict}${stored.human_approval !== undefined ? ' resolved by a human' : ''}, twelve rules identical` : `re-evaluation differs: hash ${again.inputHash.slice(0, 8)}… vs stored ${d.input_hash.slice(0, 8)}…, verdict ${again.verdict} vs ${d.verdict}` };
     }
     const failed = (stored.rules ?? []).filter((r) => !r.passed).map((r) => r.rule);
+    const lc = checks.get(d.id);
+    const ledgerCheck = lc && (ledgerOn || lc.status !== 'unanchored') ? lc : undefined;
+    if (ledgerCheck) {
+      anchored.decisions += 1;
+      if (ledgerCheck.ok === true) anchored.verified += 1;
+      else if (ledgerCheck.ok === false) anchored.tampered += 1;
+      else anchored.unmeasured += 1;
+    }
     nodes.push({
       stage: 'policy',
       at: iso(d.decided_at),
@@ -192,6 +221,7 @@ export async function auditTrail(paymentId: string): Promise<AuditTrail> {
       artefact: { verdict: d.verdict, deferred: stored.deferred ?? false, rules: stored.rules ?? [], human_approval: stored.human_approval ?? null, human_rejection: stored.human_rejection ?? null },
       reproduced: check,
       href: `/recovery/${d.case_id}`,
+      ledger: ledgerCheck,
     });
   }
 
@@ -226,5 +256,5 @@ export async function auditTrail(paymentId: string): Promise<AuditTrail> {
   const counts: Partial<Record<Stage, number>> = {};
   for (const n of nodes) counts[n.stage] = (counts[n.stage] ?? 0) + 1;
 
-  return { payment, nodes, counts, reproduced };
+  return { payment, nodes, counts, reproduced, anchored };
 }
