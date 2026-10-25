@@ -93,6 +93,7 @@ export interface Ready {
       seed: number | null;
     } | null;
     llm: { enabled: boolean; provider: string; model: string | null; reason?: string };
+    ledger?: LedgerStatus;
   };
 }
 
@@ -535,6 +536,8 @@ export interface AuditNode {
   artefact: Record<string, unknown>;
   reproduced?: { ok: boolean; detail: string };
   href?: string;
+  /** Policy nodes only, and only when a ledger is configured or the decision was anchored. */
+  ledger?: LedgerCheck;
 }
 
 export interface AuditTrail {
@@ -558,9 +561,56 @@ export interface AuditTrail {
   nodes: AuditNode[];
   counts: Partial<Record<AuditNode['stage'], number>>;
   reproduced: { checked: number; ok: number };
+  anchored: { decisions: number; verified: number; tampered: number; unmeasured: number };
 }
 
 export const fetchAudit = (paymentId: string) => api<AuditTrail>(`/api/v1/audit/${paymentId}`);
+
+// ── Ledger anchoring (optional; NPCI Drunix) ─────────────────────────────────
+
+export interface LedgerStatus {
+  enabled: boolean;
+  provider: 'none' | 'simulated' | 'drunix';
+  reason?: string;
+  target?: string;
+  lastError?: string;
+}
+
+export interface AnchorSummary {
+  id: string;
+  ledger: 'simulated' | 'drunix';
+  root: string;
+  leaf_count: number;
+  status: 'PENDING' | 'ANCHORED' | 'FAILED';
+  tx_id: string | null;
+  block_number: number | null;
+  anchored_at: string | null;
+  attempts: number;
+  last_error: string | null;
+}
+
+export interface LedgerCheck {
+  status: 'verified' | 'mismatch' | 'pending' | 'failed' | 'unanchored' | 'unavailable';
+  /** true: proven against the ledger. false: evidence of tampering. null: not measured. */
+  ok: boolean | null;
+  detail: string;
+  leaf_hash: string;
+  leaf_index: number | null;
+  proof: { side: 'left' | 'right'; hash: string }[];
+  anchor: AnchorSummary | null;
+  on_chain: { root: string; leafCount: number; txId: string; anchoredAt: string; submitter: string | null } | null;
+}
+
+export interface LedgerSummary {
+  status: LedgerStatus;
+  decisions: number;
+  unbatched: number;
+  by_anchor_status: { ANCHORED: number; PENDING: number; FAILED: number };
+  anchors: { ANCHORED: number; PENDING: number; FAILED: number };
+  last_anchor: AnchorSummary | null;
+}
+
+export const fetchLedger = () => api<LedgerSummary>('/api/v1/ledger').catch((): LedgerSummary | null => null);
 
 // ── What-if (§8.7) ───────────────────────────────────────────────────────────
 

@@ -2,6 +2,7 @@ import Link from 'next/link';
 import type { AuditNode } from '@/lib/api';
 import { SourceBadge } from '@/components/SourceBadge';
 import { AttributionBadge } from '@/components/AttributionBadge';
+import { LedgerBadge } from '@/components/LedgerBadge';
 
 const STAGE_LABEL: Record<AuditNode['stage'], string> = {
   event: 'EVENT',
@@ -33,6 +34,8 @@ const STAGE_COLOUR: Record<AuditNode['stage'], string> = {
  * Every node shows its timestamp, its inputs and the artefact it produced.
  * Where a stage stored its inputs, the API recomputed it on this request and
  * the node says whether it reproduced — that is the claim the page makes.
+ * With a ledger configured, a policy node also says whether the decision, as
+ * stored now, still proves into the Merkle root the ledger holds for it.
  */
 export function AuditTimeline({ nodes }: { nodes: AuditNode[] }) {
   return (
@@ -62,6 +65,7 @@ export function AuditTimeline({ nodes }: { nodes: AuditNode[] }) {
                 {n.reproduced.ok ? '✓ reproduced' : '✗ did not reproduce'} — {n.reproduced.detail}
               </div>
             )}
+            {n.ledger && <LedgerLine check={n.ledger} />}
             {(n.stage === 'agent' || n.stage === 'diagnosis') && typeof n.artefact.narrative === 'string' && (
               <p style={{ margin: '6px 0 0', fontSize: 12, lineHeight: 1.6, color: 'var(--text-secondary)' }}>{n.artefact.narrative}</p>
             )}
@@ -76,6 +80,37 @@ export function AuditTimeline({ nodes }: { nodes: AuditNode[] }) {
         </li>
       ))}
     </ol>
+  );
+}
+
+const LEDGER_LABEL: Record<NonNullable<AuditNode['ledger']>['status'], string> = {
+  verified: '✓ anchored',
+  mismatch: '✗ does not match the ledger',
+  pending: '… awaiting the ledger',
+  failed: '! anchoring failed',
+  unanchored: '○ not anchored',
+  unavailable: '? ledger unreachable',
+};
+
+/** True is proven, false is evidence of tampering, null is not measured — three colours, never two. */
+function LedgerLine({ check }: { check: NonNullable<AuditNode['ledger']> }) {
+  const colour = check.ok === true ? 'var(--success)' : check.ok === false ? 'var(--danger)' : 'var(--text-tertiary)';
+  return (
+    <div style={{ marginTop: 4, fontSize: 11, color: colour, display: 'flex', gap: 6, alignItems: 'baseline', flexWrap: 'wrap' }}>
+      <span>{LEDGER_LABEL[check.status]}</span>
+      {check.anchor && <LedgerBadge ledger={check.anchor.ledger} />}
+      <span>— {check.detail}</span>
+      {check.proof.length > 0 && (
+        <details style={{ width: '100%' }}>
+          <summary style={{ fontSize: 10, color: 'var(--text-tertiary)', cursor: 'pointer' }}>
+            inclusion proof · leaf {check.leaf_index} of {check.anchor?.leaf_count} · {check.proof.length} step{check.proof.length === 1 ? '' : 's'}
+          </summary>
+          <pre className="mono" style={{ fontSize: 10, lineHeight: 1.5, margin: '4px 0 0', padding: 8, background: 'var(--bg)', border: '1px solid var(--border)', borderRadius: 6, whiteSpace: 'pre-wrap', wordBreak: 'break-all', color: 'var(--text-secondary)' }}>
+            {[`leaf  ${check.leaf_hash}`, ...check.proof.map((p) => `${p.side === 'left' ? 'left ' : 'right'} ${p.hash}`), `root  ${check.anchor?.root ?? '—'}`, check.anchor?.tx_id ? `tx    ${check.anchor.tx_id}${check.anchor.block_number !== null ? ` · block ${check.anchor.block_number}` : ''}` : ''].filter(Boolean).join('\n')}
+          </pre>
+        </details>
+      )}
+    </div>
   );
 }
 

@@ -1,5 +1,6 @@
 import Link from 'next/link';
-import { api } from '@/lib/api';
+import { api, fetchLedger, type LedgerSummary } from '@/lib/api';
+import { LedgerBadge } from '@/components/LedgerBadge';
 import { formatInrCompact, formatCount, exactPaise } from '@/lib/format';
 
 export const dynamic = 'force-dynamic';
@@ -13,11 +14,16 @@ interface Decisions { decisions: { id: string; case_id: string; payment_id: stri
  *
  * The `PolicyApprovedAction` snippet is on the page on purpose: the guardrail
  * is a compile error, and a screenshot of the type says it faster than prose.
+ *
+ * The ledger panel is the other half of "append-only": the log is batched
+ * into Merkle roots and anchored, optionally on NPCI Drunix, so a rewritten
+ * decision is detectable by someone who does not trust this database.
  */
 export default async function PolicyPage() {
-  const [rules, log] = await Promise.all([
+  const [rules, log, ledger] = await Promise.all([
     api<Rules>('/api/v1/policy/rules').catch((): Rules | null => null),
     api<Decisions>('/api/v1/policy/decisions?limit=80').catch((): Decisions | null => null),
+    fetchLedger(),
   ]);
   const counts = log?.counts ?? { ALLOW: 0, DENY: 0, REQUIRE_APPROVAL: 0 };
   const total = (counts.ALLOW ?? 0) + (counts.DENY ?? 0) + (counts.REQUIRE_APPROVAL ?? 0);
@@ -63,6 +69,8 @@ export default async function PolicyPage() {
         </div>
       </section>
 
+      {ledger && <LedgerPanel ledger={ledger} />}
+
       <section className="card" style={{ marginTop: 8 }}>
         <div className="label">Decision log (newest first)</div>
         {(log?.decisions.length ?? 0) === 0 ? (
@@ -96,6 +104,54 @@ export default async function PolicyPage() {
 const th: React.CSSProperties = { textAlign: 'left', fontWeight: 510, padding: '0 8px 6px 0', borderBottom: '1px solid var(--border)' };
 const thR: React.CSSProperties = { ...th, textAlign: 'right' };
 const td: React.CSSProperties = { fontSize: 12, padding: '4px 8px 4px 0' };
+
+/**
+ * Every count is a count of decisions, split by the state of the batch that
+ * holds them — so "anchored" never includes a decision whose root has not been
+ * confirmed by the ledger.
+ */
+function LedgerPanel({ ledger }: { ledger: LedgerSummary }) {
+  const s = ledger.status;
+  const last = ledger.last_anchor;
+  return (
+    <section className="card" style={{ marginTop: 8 }}>
+      <div style={{ display: 'flex', alignItems: 'baseline', gap: 8 }}>
+        <div className="label">Tamper-evident log</div>
+        {s.provider !== 'none' && <LedgerBadge ledger={s.provider} />}
+        <span style={{ fontSize: 11, color: 'var(--text-tertiary)', marginLeft: 'auto' }} className="mono">{s.target ?? ''}</span>
+      </div>
+      {!s.enabled ? (
+        <p style={{ fontSize: 12, color: 'var(--text-secondary)', lineHeight: 1.7, margin: '6px 0 0' }}>
+          Off — <span className="mono">{s.reason}</span>. The log is complete without it; anchoring only adds evidence. Set{' '}
+          <span className="mono">LEDGER_PROVIDER=simulated</span> to see the flow, or <span className="mono">drunix</span> to anchor
+          Merkle roots of these decisions on NPCI&apos;s permissioned ledger.
+          {ledger.by_anchor_status.ANCHORED > 0 && ` ${formatCount(ledger.by_anchor_status.ANCHORED)} decisions were anchored earlier and are still checked on /audit.`}
+        </p>
+      ) : (
+        <>
+          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: 8, marginTop: 10 }}>
+            <Tile label="Anchored" value={formatCount(ledger.by_anchor_status.ANCHORED)} note={`of ${formatCount(ledger.decisions)} decisions, in ${formatCount(ledger.anchors.ANCHORED)} Merkle roots the ledger confirmed`} tone="success" />
+            <Tile label="Awaiting the ledger" value={formatCount(ledger.by_anchor_status.PENDING + ledger.unbatched)} note={`${formatCount(ledger.unbatched)} not yet batched · ${formatCount(ledger.by_anchor_status.PENDING)} in ${formatCount(ledger.anchors.PENDING)} pending roots`} />
+            <Tile label="Failed" value={formatCount(ledger.by_anchor_status.FAILED)} note={`${formatCount(ledger.anchors.FAILED)} roots the ledger refused or never answered for — retry once fixed`} tone={ledger.anchors.FAILED > 0 ? 'danger' : undefined} />
+            <Tile
+              label="Last anchor"
+              value={last ? (last.block_number !== null ? `#${formatCount(last.block_number)}` : 'reconciled') : '—'}
+              note={last ? `tx ${last.tx_id?.slice(0, 16)}… · ${formatCount(last.leaf_count)} decisions · ${last.anchored_at?.replace('T', ' ').slice(5, 16) ?? ''}` : 'nothing anchored yet'}
+            />
+          </div>
+          <p style={{ fontSize: 11, color: 'var(--text-tertiary)', lineHeight: 1.6, margin: '10px 0 0' }}>
+            Only a root, a leaf count and a time range leave this database — never a decision, an amount or a customer. Any decision can be
+            proven into its root on its payment&apos;s audit page (the <span className="mono">audit</span> link in the log below), where it is re-hashed as it stands and the root is looked up on the ledger.
+            {s.provider === 'simulated' && ' This is the simulated ledger: a table in this database. It exercises every check; it proves nothing to a third party.'}
+          </p>
+          {s.lastError && (
+            <p className="mono" style={{ fontSize: 11, color: 'var(--danger)', margin: '6px 0 0' }}>last ledger error: {s.lastError}</p>
+          )}
+        </>
+      )}
+    </section>
+  );
+}
 
 function Tile({ label, value, note, tone }: { label: string; value: string; note: string; tone?: 'success' | 'danger' | 'warning' | undefined }) {
   const c = tone === 'success' ? 'var(--success)' : tone === 'danger' ? 'var(--danger)' : tone === 'warning' ? 'var(--warning)' : 'var(--text)';
