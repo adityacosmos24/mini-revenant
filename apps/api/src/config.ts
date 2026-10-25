@@ -47,6 +47,32 @@ const Schema = z.object({
   ANTHROPIC_API_KEY: z.string().default(''),
   OPENAI_API_KEY: z.string().default(''),
   GOOGLE_GENERATIVE_AI_API_KEY: z.string().default(''),
+
+  // ── Ledger anchoring ─────────────────────────────────────────────────────
+  // Optional, like the LLM: `none` is the default and every code path works
+  // without it. `simulated` anchors to a table in this database (the flow, not
+  // the guarantee); `drunix` anchors to NPCI's Fabric-compatible ledger
+  // through the Fabric Gateway client. Postgres stays the source of truth in
+  // every mode — the ledger only ever holds Merkle roots.
+  LEDGER_PROVIDER: z.enum(['none', 'simulated', 'drunix']).default('none'),
+  // Decisions per Merkle root. A proof is ⌈log₂ n⌉ hashes, so 256 → 8.
+  LEDGER_BATCH_SIZE: z.coerce.number().int().positive().max(4096).default(256),
+  LEDGER_INTERVAL_MS: z.coerce.number().int().positive().default(5000),
+  // Endorse + order + commit is seconds, not milliseconds. Reads on the page
+  // path use a shorter deadline (lib/drunix.ts) so a slow peer cannot hang /audit.
+  LEDGER_TIMEOUT_MS: z.coerce.number().int().positive().default(15000),
+
+  // Defaults match drunix-network/test-network: Org1's Lite Peer behind the
+  // Fabric Gateway service. Cert and key paths may name a file or the MSP
+  // directory that holds it (`signcerts/`, `keystore/`).
+  DRUNIX_PEER_ENDPOINT: z.string().min(1).default('localhost:7051'),
+  DRUNIX_PEER_HOST_ALIAS: z.string().default('peer0.org1.example.com'),
+  DRUNIX_TLS_CERT_PATH: z.string().default(''),
+  DRUNIX_MSP_ID: z.string().min(1).default('Org1MSP'),
+  DRUNIX_CERT_PATH: z.string().default(''),
+  DRUNIX_KEY_PATH: z.string().default(''),
+  DRUNIX_CHANNEL: z.string().min(1).default('mychannel'),
+  DRUNIX_CHAINCODE: z.string().min(1).default('revenant-anchor'),
 });
 
 export type Config = z.infer<typeof Schema>;
